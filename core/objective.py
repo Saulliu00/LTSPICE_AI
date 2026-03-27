@@ -602,6 +602,235 @@ class PeakObjective(ObjectiveFunction):
 
 
 # ---------------------------------------------------------------------------
+# CenterFrequencyObjective
+# ---------------------------------------------------------------------------
+
+
+class CenterFrequencyObjective(ObjectiveFunction):
+    """Penalise deviation of the response peak frequency from a target.
+
+    Used for band-pass filters and resonant circuits where the center
+    frequency f_0 is the frequency of maximum magnitude.
+
+    Parameters
+    ----------
+    target_signal:
+        Signal to analyse, e.g. ``"V(out)"``.
+    target_center_hz:
+        Desired center (peak) frequency in Hz.
+    """
+
+    def __init__(self, target_signal: str, target_center_hz: float) -> None:
+        self.target_signal = target_signal
+        self.target_center_hz = float(target_center_hz)
+
+    @property
+    def name(self) -> str:
+        return "center_frequency"
+
+    def evaluate(
+        self, result: SimulationResult, params: ParameterSet
+    ) -> float:
+        """Return |f_0_actual − f_0_target| in Hz (lower is better)."""
+        if self.target_signal not in result.signals:
+            logger.error("CenterFrequencyObjective: signal %s not found.", self.target_signal)
+            return float("inf")
+
+        freq = result.time_or_freq
+        mag_db = _magnitude_db(result.signals[self.target_signal])
+
+        f0_actual = float(freq[int(np.argmax(mag_db))])
+        score = abs(f0_actual - self.target_center_hz)
+        logger.debug(
+            "CenterFrequencyObjective: f0_actual=%.3g Hz  target=%.3g Hz  score=%.4g",
+            f0_actual, self.target_center_hz, score,
+        )
+        return score
+
+
+# ---------------------------------------------------------------------------
+# GainAtFrequencyObjective
+# ---------------------------------------------------------------------------
+
+
+class GainAtFrequencyObjective(ObjectiveFunction):
+    """Penalise deviation of the gain at a specific frequency from a target.
+
+    Useful for ensuring flat passband gain, minimum stopband attenuation,
+    or a specific gain at the amplifier's operating frequency.
+
+    Parameters
+    ----------
+    target_signal:
+        Signal to analyse, e.g. ``"V(out)"``.
+    target_gain_db:
+        Desired gain in dB at *target_freq_hz*.
+    target_freq_hz:
+        Frequency (Hz) at which to measure the gain.
+    """
+
+    def __init__(
+        self,
+        target_signal: str,
+        target_gain_db: float,
+        target_freq_hz: float,
+    ) -> None:
+        self.target_signal = target_signal
+        self.target_gain_db = float(target_gain_db)
+        self.target_freq_hz = float(target_freq_hz)
+
+    @property
+    def name(self) -> str:
+        return "gain_at_frequency"
+
+    def evaluate(
+        self, result: SimulationResult, params: ParameterSet
+    ) -> float:
+        """Return |gain_actual_dB − gain_target_dB| (lower is better)."""
+        if self.target_signal not in result.signals:
+            logger.error("GainAtFrequencyObjective: signal %s not found.", self.target_signal)
+            return float("inf")
+
+        freq = result.time_or_freq
+        mag_db = _magnitude_db(result.signals[self.target_signal])
+
+        # Find the index closest to target frequency
+        idx = int(np.argmin(np.abs(freq - self.target_freq_hz)))
+        actual_gain_db = float(mag_db[idx])
+
+        score = abs(actual_gain_db - self.target_gain_db)
+        logger.debug(
+            "GainAtFrequencyObjective: gain_actual=%.2f dB  target=%.2f dB  @ %.3g Hz  score=%.4g",
+            actual_gain_db, self.target_gain_db, self.target_freq_hz, score,
+        )
+        return score
+
+
+# ---------------------------------------------------------------------------
+# CompositeObjective
+# ---------------------------------------------------------------------------
+
+
+class CompositeObjective(ObjectiveFunction):
+    """Weighted sum of multiple sub-objectives.
+
+    Allows simultaneous optimisation toward several performance targets,
+    e.g. bandwidth + center frequency + passband gain.
+
+    Parameters
+    ----------
+    objectives:
+        List of :class:`ObjectiveFunction` instances.
+    weights:
+        Corresponding list of non-negative floats.  Each sub-score is
+        multiplied by its weight before summing.  Weights need not sum
+        to 1; they express relative importance.
+
+    Example
+    -------
+    ::
+
+        composite = CompositeObjective(
+            objectives=[BandwidthObjective("V(out)", 200.0),
+                        CenterFrequencyObjective("V(out)", 1000.0)],
+            weights=[1.0, 0.5],
+        )
+        score = composite.evaluate(result, params)
+    """
+
+    def __init__(
+        self,
+        objectives: list,
+        weights: list,
+    ) -> None:
+        if len(objectives) != len(weights):
+            raise ValueError("objectives and weights must have the same length")
+        if not objectives:
+            raise ValueError("CompositeObjective requires at least one sub-objective")
+        self.objectives = objectives
+        self.weights = [float(w) for w in weights]
+
+    @property
+    def name(self) -> str:
+        names = "+".join(o.name for o in self.objectives)
+        return f"composite({names})"
+
+    def evaluate(
+        self, result: SimulationResult, params: ParameterSet
+    ) -> float:
+        """Return the weighted sum of all sub-objective scores."""
+        total = 0.0
+        for obj, w in zip(self.objectives, self.weights):
+            sub_score = obj.evaluate(result, params)
+            logger.debug(
+                "CompositeObjective: %s score=%.4g  weight=%.2f  contribution=%.4g",
+                obj.name, sub_score, w, w * sub_score,
+            )
+            total += w * sub_score
+        logger.debug("CompositeObjective: total=%.4g", total)
+        return total
+
+    @classmethod
+    def from_targets_config(cls, targets_cfg: dict) -> "CompositeObjective":
+        """Build a CompositeObjective from the ``targets:`` config section.
+
+        Each key in *targets_cfg* is a target type; the value is a dict
+        with ``signal``, ``value``, ``weight``, and any type-specific keys.
+
+        Supported target types
+        ----------------------
+        ``bandwidth``
+            BPF bandwidth (f_high − f_low).  Keys: signal, value (Hz), weight.
+        ``center_frequency``
+            Frequency of peak response.  Keys: signal, value (Hz), weight.
+        ``cutoff``
+            LPF/HPF -3 dB point.  Keys: signal, value (Hz), filter_type, weight.
+        ``gain_at_frequency``
+            Gain at a specific frequency.  Keys: signal, value (dB), freq (Hz), weight.
+
+        Example config::
+
+            targets:
+              bandwidth:
+                signal: "V(out)"
+                value: 200.0
+                weight: 1.0
+              center_frequency:
+                signal: "V(out)"
+                value: 1000.0
+                weight: 1.0
+        """
+        objectives = []
+        weights = []
+
+        for target_type, cfg in targets_cfg.items():
+            signal = cfg.get("signal", "V(out)")
+            value = float(cfg.get("value", 0.0))
+            weight = float(cfg.get("weight", 1.0))
+            target_type_key = target_type.lower().strip()
+
+            if target_type_key == "bandwidth":
+                objectives.append(BandwidthObjective(signal, value))
+            elif target_type_key == "center_frequency":
+                objectives.append(CenterFrequencyObjective(signal, value))
+            elif target_type_key == "cutoff":
+                filter_type = cfg.get("filter_type", "lowpass")
+                objectives.append(CutoffObjective(signal, value, filter_type))
+            elif target_type_key == "gain_at_frequency":
+                freq = float(cfg.get("freq", 1000.0))
+                objectives.append(GainAtFrequencyObjective(signal, value, freq))
+            else:
+                raise ValueError(
+                    f"Unknown target type: {target_type_key!r}. "
+                    f"Valid: 'bandwidth', 'center_frequency', 'cutoff', 'gain_at_frequency'."
+                )
+            weights.append(weight)
+            logger.debug("CompositeObjective: added %s (weight=%.2f)", target_type_key, weight)
+
+        return cls(objectives=objectives, weights=weights)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -609,28 +838,33 @@ class PeakObjective(ObjectiveFunction):
 def create_objective(config: dict) -> ObjectiveFunction:
     """Create an :class:`ObjectiveFunction` from a config dictionary.
 
-    Config keys by type
-    -------------------
+    Accepts TWO config formats:
 
-    ``type: cutoff``  (low-pass / high-pass)
-        - ``target_signal``   – e.g. ``"V(out)"``
-        - ``target_cutoff_hz`` – desired -3 dB cutoff in Hz
-        - ``filter_type``     – ``"lowpass"`` (default) or ``"highpass"``
+    **Format 1 — ``targets:`` section (recommended)**
+    Define multiple weighted performance goals::
 
-    ``type: bandwidth``  (band-pass)
-        - ``target_signal``   – e.g. ``"V(out)"``
-        - ``target_bw_hz``    – desired bandwidth (f_high − f_low) in Hz
+        targets:
+          bandwidth:
+            signal: "V(out)"
+            value: 200.0        # Hz
+            weight: 1.0
+          center_frequency:
+            signal: "V(out)"
+            value: 1000.0       # Hz
+            weight: 1.0
 
-    ``type: mse``
-        - ``target_signal``
-        - ``target_values``   – list of target dB values
-        - ``freq_weights``    – optional list of per-frequency weights
+    Supported target types: ``bandwidth``, ``center_frequency``,
+    ``cutoff`` (+ ``filter_type``), ``gain_at_frequency`` (+ ``freq``).
 
-    ``type: peak``
-        - ``target_signal``
-        - ``target_peak_db``  – desired peak magnitude in dB
-        - ``target_freq_hz``  – desired peak frequency in Hz
-        - ``freq_tolerance_decades`` – search window (default 0.5)
+    **Format 2 — ``objective:`` section (single objective)**::
+
+        objective:
+          type: cutoff
+          target_signal: "V(out)"
+          filter_type: lowpass
+          target_cutoff_hz: 1000.0
+
+    Supported types: ``cutoff``, ``bandwidth``, ``mse``, ``peak``.
 
     Returns
     -------
@@ -641,21 +875,24 @@ def create_objective(config: dict) -> ObjectiveFunction:
     ValueError
         For unknown type or missing required keys.
     """
+    # --- Format 1: targets dict ---
+    # Detected when config has no 'type' key (it's the targets section directly)
+    if "type" not in config and len(config) > 0:
+        logger.debug("create_objective: using CompositeObjective from targets config")
+        return CompositeObjective.from_targets_config(config)
+
+    # --- Format 2: single objective ---
     obj_type = config.get("type", "").lower()
     signal = config.get("target_signal", "V(out)")
 
     if obj_type == "cutoff":
         cutoff = config.get("target_cutoff_hz")
         if cutoff is None:
-            raise ValueError(
-                "CutoffObjective requires 'target_cutoff_hz' in config"
-            )
+            raise ValueError("CutoffObjective requires 'target_cutoff_hz' in config")
         filter_type = config.get("filter_type", "lowpass")
         logger.debug(
             "Creating CutoffObjective: signal=%s  filter=%s  f_c=%.3g Hz",
-            signal,
-            filter_type,
-            float(cutoff),
+            signal, filter_type, float(cutoff),
         )
         return CutoffObjective(
             target_signal=signal,
@@ -666,18 +903,12 @@ def create_objective(config: dict) -> ObjectiveFunction:
     elif obj_type == "bandwidth":
         bw = config.get("target_bw_hz")
         if bw is None:
-            raise ValueError(
-                "BandwidthObjective requires 'target_bw_hz' in config"
-            )
+            raise ValueError("BandwidthObjective requires 'target_bw_hz' in config")
         logger.debug(
             "Creating BandwidthObjective (BPF): signal=%s  target_bw=%.3g Hz",
-            signal,
-            float(bw),
+            signal, float(bw),
         )
-        return BandwidthObjective(
-            target_signal=signal,
-            target_bw_hz=float(bw),
-        )
+        return BandwidthObjective(target_signal=signal, target_bw_hz=float(bw))
 
     elif obj_type == "mse":
         target_values = config.get("target_values")
@@ -707,9 +938,7 @@ def create_objective(config: dict) -> ObjectiveFunction:
             target_signal=signal,
             target_peak_db=float(target_peak_db),
             target_freq_hz=float(target_freq_hz),
-            freq_tolerance_decades=float(
-                config.get("freq_tolerance_decades", 0.5)
-            ),
+            freq_tolerance_decades=float(config.get("freq_tolerance_decades", 0.5)),
         )
 
     else:

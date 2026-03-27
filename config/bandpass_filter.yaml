@@ -1,0 +1,86 @@
+# LTspice AI – Band-Pass Filter Optimization
+# Circuit: circuits/bandpass_filter.asc (series RLC)
+#
+# How to run:
+#   python3 main.py --config config/bandpass_filter.yaml --demo
+#   python3 main.py --config config/bandpass_filter.yaml          # real LTspice
+#   python3 main.py --inspect circuits/bandpass_filter.asc        # discover params
+
+ltspice:
+  executable: "/Applications/LTspice.app/Contents/MacOS/LTspice"
+  # executable: "C:/Program Files/LTC/LTspiceXVII/XVIIx64.exe"
+  timeout: 60
+  retry_count: 3
+
+circuit:
+  schematic_path: "circuits/bandpass_filter.asc"
+
+# ---------------------------------------------------------------------------
+# Tunable parameters (discovered via: python3 main.py --inspect circuits/bandpass_filter.asc)
+# ---------------------------------------------------------------------------
+parameters:
+  R1:
+    min: 1.0
+    max: 10000.0
+    log_scale: true
+    type: float
+
+  L1:
+    min: 1.0e-6       # 1 µH
+    max: 1.0e-3       # 1 mH
+    log_scale: true
+    type: float
+
+  C1:
+    min: 1.0e-9       # 1 nF
+    max: 1.0e-4       # 100 µF
+    log_scale: true
+    type: float
+
+# ---------------------------------------------------------------------------
+# Performance targets — define what you want the circuit to achieve
+# ---------------------------------------------------------------------------
+#
+# Each target contributes a weighted penalty:
+#   score = sum(weight_i * |actual_i - target_i|)
+#
+# Multiple targets are combined automatically into a CompositeObjective.
+#
+targets:
+  center_frequency:
+    signal: "V(out)"
+    value: 1000.0           # Desired peak frequency (Hz)
+    weight: 1.0
+
+  bandwidth:
+    signal: "V(out)"
+    value: 200.0            # Desired BW = f_high - f_low (Hz)
+    weight: 1.0             # Equal weight to center_frequency
+
+  # gain_at_frequency:      # Uncomment to also target passband gain
+  #   signal: "V(out)"
+  #   value: -3.0           # Desired gain at center in dB (0 dB = unity)
+  #   freq: 1000.0
+  #   weight: 0.5
+
+# ---------------------------------------------------------------------------
+optimization:
+  engine: optuna
+  n_trials: 80
+  direction: minimize
+  seed: 42
+  sampler: tpe
+
+# ---------------------------------------------------------------------------
+visualization:
+  output_dir: "results/plots"
+  show_browser: true
+  save_html: true
+
+cache:
+  enabled: true
+  cache_dir: "results/cache"
+
+logging:
+  level: INFO
+  log_file: "results/run.log"

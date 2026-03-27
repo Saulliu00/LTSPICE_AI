@@ -392,6 +392,72 @@ class NetlistEditor:
 
         self._write_tmp("".join(new_lines))
 
+    def inspect(self) -> dict:
+        """Scan the original schematic and return discovered parameters.
+
+        Finds:
+        - All ``{PARAM}`` references used as component values
+        - ``.param NAME=VALUE`` default values
+        - Component instances (R1, C1, L1, …) with their values
+        - Simulation directives (``.ac``, ``.tran``, ``.dc``, ``.op``)
+
+        Returns
+        -------
+        dict with keys:
+            ``param_refs``     – sorted list of parameter names found inside ``{...}``
+            ``param_defaults`` – dict of param name → default value string
+            ``components``     – dict of InstName → value string
+            ``sim_directives`` – list of simulation directive strings
+        """
+        text = self._original_text
+
+        # 1. Find all {PARAM} references anywhere in the file
+        param_refs = sorted(set(re.findall(r'\{(\w+)\}', text)))
+
+        # 2. Find .param directives (may appear inside TEXT lines in .asc)
+        #    Handles:  .param R1=10k  or  .param R1=10k C1=100n L1=1u
+        param_defaults: dict = {}
+        for line in text.splitlines():
+            # Strip leading TEXT/annotation prefix if present
+            clean = re.sub(r'^TEXT\s+[-\d]+\s+[-\d]+\s+\w+\s+\d+\s+', '', line, flags=re.IGNORECASE).strip()
+            if not clean.lower().startswith('.param'):
+                continue
+            for pair in re.finditer(r'(\w+)\s*=\s*(\S+)', clean[len('.param'):], re.IGNORECASE):
+                param_defaults[pair.group(1)] = pair.group(2)
+
+        # 3. Find component instances and their values from SYMATTR blocks
+        components: dict = {}
+        current_inst: str | None = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            m_inst = re.match(r'SYMATTR\s+InstName\s+(\S+)', stripped, re.IGNORECASE)
+            if m_inst:
+                current_inst = m_inst.group(1)
+                continue
+            if current_inst:
+                m_val = re.match(r'SYMATTR\s+Value\s+(\S+)', stripped, re.IGNORECASE)
+                if m_val:
+                    components[current_inst] = m_val.group(1)
+                    current_inst = None
+                    continue
+                # Reset context if a non-SYMATTR line is hit
+                if not stripped.startswith('SYMATTR'):
+                    current_inst = None
+
+        # 4. Collect simulation directives from TEXT annotations
+        sim_directives: list = []
+        for line in text.splitlines():
+            clean = re.sub(r'^TEXT\s+[-\d]+\s+[-\d]+\s+\w+\s+\d+\s+', '', line, flags=re.IGNORECASE).strip()
+            if re.match(r'\.(ac|tran|dc|op)\b', clean, re.IGNORECASE):
+                sim_directives.append(clean)
+
+        return {
+            'param_refs': param_refs,
+            'param_defaults': param_defaults,
+            'components': components,
+            'sim_directives': sim_directives,
+        }
+
     def __del__(self) -> None:
         """Clean up the temp file on garbage collection."""
         try:
@@ -399,3 +465,21 @@ class NetlistEditor:
                 Path(self._tmp_path).unlink(missing_ok=True)
         except Exception:  # noqa: BLE001
             pass
+
+
+def inspect_netlist(schematic_path: str) -> dict:
+    """Convenience function: inspect a schematic without keeping a full editor.
+
+    Parameters
+    ----------
+    schematic_path:
+        Path to the ``.asc`` file.
+
+    Returns
+    -------
+    dict
+        Same structure as :meth:`NetlistEditor.inspect`.
+    """
+    editor = NetlistEditor(schematic_path)
+    result = editor.inspect()
+    return result

@@ -100,6 +100,37 @@ def _synthetic_rc_simulation(params: ParameterSet) -> SimulationResult:
     )
 
 
+def _synthetic_rlc_simulation(params: ParameterSet) -> SimulationResult:
+    """Generate analytic AC sweep data for a series RLC band-pass filter.
+
+    Transfer function (output across R):
+
+        H(jω) = (jω·R/L) / (1/LC + jω·R/L − ω²)
+
+    Parameters
+    ----------
+    params:
+        Must contain ``"R1"`` (Ω), ``"L1"`` (H), ``"C1"`` (F).
+    """
+    R = params.get("R1", 10.0)
+    L = params.get("L1", 10e-6)
+    C = params.get("C1", 2.533e-6)
+
+    freq = np.logspace(np.log10(10), np.log10(100e6), num=701)
+    omega = 2 * np.pi * freq
+    # H(jω) = jω(R/L) / ((jω)² + jω(R/L) + 1/(LC))
+    jw = 1j * omega
+    H = (jw * R / L) / (jw**2 + jw * R / L + 1.0 / (L * C))
+
+    return SimulationResult(
+        signals={"V(out)": H},
+        time_or_freq=freq,
+        sim_type="ac",
+        raw_file="(synthetic-rlc)",
+        metadata={"R1": R, "L1": L, "C1": C},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -183,9 +214,19 @@ class Pipeline:
         # Result parser & objective
         # ------------------------------------------------------------------
         self.parser = ResultParser(sim_type="ac")
-        obj_cfg = self.config.get("objective", {})
-        self.objective: ObjectiveFunction = create_objective(obj_cfg)
-        logger.info("Objective: %s", self.objective.name)
+        # Support both new 'targets:' section and legacy 'objective:' section
+        if "targets" in self.config:
+            targets_cfg = self.config["targets"]
+            self.objective: ObjectiveFunction = create_objective(targets_cfg)
+            logger.info(
+                "Objective: %s  (from targets: %s)",
+                self.objective.name,
+                list(targets_cfg.keys()),
+            )
+        else:
+            obj_cfg = self.config.get("objective", {})
+            self.objective: ObjectiveFunction = create_objective(obj_cfg)
+            logger.info("Objective: %s", self.objective.name)
 
         # ------------------------------------------------------------------
         # Cache
@@ -256,7 +297,11 @@ class Pipeline:
         # 2. Simulate
         try:
             if self.demo_mode:
-                result = _synthetic_rc_simulation(params)
+                # Auto-select synthetic model based on which parameters are present
+                if "L1" in params:
+                    result = _synthetic_rlc_simulation(params)
+                else:
+                    result = _synthetic_rc_simulation(params)
             else:
                 result = self._run_ltspice(params)
         except Exception as exc:  # noqa: BLE001
@@ -493,7 +538,109 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="Disable automatic browser opening for plots.",
     )
+    parser.add_argument(
+        "--inspect",
+        metavar="ASC_PATH",
+        default=None,
+        help=(
+            "Inspect an LTspice .asc file and print discovered parameters. "
+            "Does not run any simulation. "
+            "Example: python main.py --inspect circuits/bandpass_filter.asc"
+        ),
+    )
     return parser
+
+
+def _run_inspect(asc_path: str) -> None:
+    """Scan a .asc schematic and print discovered parameters + suggested config.
+
+    Parameters
+    ----------
+    asc_path:
+        Path to the LTspice ``.asc`` file to inspect.
+    """
+    from core.netlist_editor import inspect_netlist
+
+    path = Path(asc_path)
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+
+    if not path.exists():
+        print(f"ERROR: File not found: {path}")
+        sys.exit(1)
+
+    print(f"\nInspecting: {path}\n{'='*60}")
+    info = inspect_netlist(str(path))
+
+    # --- Parameter references ---
+    refs = info["param_refs"]
+    defaults = info["param_defaults"]
+    print(f"\nTunable parameters found ({len(refs)}):")
+    if refs:
+        for name in refs:
+            default = defaults.get(name, defaults.get(name.upper(), "<no default>"))
+            print(f"  {{{name}}}   default = {default}")
+    else:
+        print("  (none — use {{PARAM}} syntax in component values to make them tunable)")
+
+    # --- Components ---
+    comps = info["components"]
+    print(f"\nComponent instances ({len(comps)}):")
+    for inst, val in sorted(comps.items()):
+        print(f"  {inst:<8s}  value = {val}")
+
+    # --- Simulation directives ---
+    sim = info["sim_directives"]
+    print(f"\nSimulation directives:")
+    if sim:
+        for d in sim:
+            print(f"  {d}")
+    else:
+        print("  (none found — add .ac/.tran/.dc to your schematic)")
+
+    # --- Suggested config snippet ---
+    print(f"\n{'='*60}")
+    print("Suggested config/parameters section:\n")
+    print("  parameters:")
+    for name in refs:
+        default_str = defaults.get(name, defaults.get(name.upper(), ""))
+        # Try to guess magnitude for reasonable bounds
+        print(f"    {name}:")
+        print(f"      min: ???          # set your lower bound")
+        print(f"      max: ???          # set your upper bound")
+        print(f"      log_scale: true   # recommended for R, C, L")
+        print(f"      type: float")
+        if default_str:
+            print(f"      # default in schematic: {default_str}")
+
+    print("\nSuggested config/targets section:\n")
+    print("  targets:")
+    print("    # Choose the targets relevant to your circuit type:")
+    print("    #")
+    print("    # Band-pass filter:")
+    print("    # bandwidth:")
+    print("    #   signal: V(out)")
+    print("    #   value: 200.0       # desired BW = f_high - f_low (Hz)")
+    print("    #   weight: 1.0")
+    print("    # center_frequency:")
+    print("    #   signal: V(out)")
+    print("    #   value: 1000.0      # desired peak frequency (Hz)")
+    print("    #   weight: 1.0")
+    print("    #")
+    print("    # Low-pass / High-pass filter:")
+    print("    # cutoff:")
+    print("    #   signal: V(out)")
+    print("    #   value: 1000.0      # desired -3 dB cutoff (Hz)")
+    print("    #   filter_type: lowpass")
+    print("    #   weight: 1.0")
+    print("    #")
+    print("    # Amplifier / specific frequency gain:")
+    print("    # gain_at_frequency:")
+    print("    #   signal: V(out)")
+    print("    #   value: 0.0         # desired gain in dB")
+    print("    #   freq: 1000.0       # at this frequency (Hz)")
+    print("    #   weight: 1.0")
+    print()
 
 
 def main() -> None:
@@ -510,6 +657,13 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stderr,
     )
+
+    # ------------------------------------------------------------------
+    # --inspect mode: scan .asc and print parameters, then exit
+    # ------------------------------------------------------------------
+    if args.inspect:
+        _run_inspect(args.inspect)
+        return
 
     # ------------------------------------------------------------------
     # Build pipeline
