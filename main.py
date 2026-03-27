@@ -105,7 +105,7 @@ def _synthetic_rlc_simulation(params: ParameterSet) -> SimulationResult:
 
     Transfer function (output across R):
 
-        H(jω) = (jω·R/L) / (1/LC + jω·R/L − ω²)
+        H(jω) = jω(R/L) / ((jω)² + jω(R/L) + 1/(LC))
 
     Parameters
     ----------
@@ -225,7 +225,7 @@ class Pipeline:
             )
         else:
             obj_cfg = self.config.get("objective", {})
-            self.objective: ObjectiveFunction = create_objective(obj_cfg)
+            self.objective = create_objective(obj_cfg)
             logger.info("Objective: %s", self.objective.name)
 
         # ------------------------------------------------------------------
@@ -693,9 +693,13 @@ def main() -> None:
 
     best_result = best_trial.result
     if best_result is None and pipeline.demo_mode:
-        # Re-run synthetic simulation with best params for plotting
+        # Re-run synthetic simulation with best params for plotting.
+        # Use the RLC model when L1 is present (bandpass config), otherwise RC.
         logger.info("Re-running synthetic simulation with best params for plots")
-        best_result = _synthetic_rc_simulation(best_trial.params)
+        if "L1" in best_trial.params:
+            best_result = _synthetic_rlc_simulation(best_trial.params)
+        else:
+            best_result = _synthetic_rc_simulation(best_trial.params)
 
     if best_result is not None:
         pipeline.visualize_results(best_result)

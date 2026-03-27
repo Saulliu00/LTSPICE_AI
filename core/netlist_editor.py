@@ -310,18 +310,33 @@ class NetlistEditor:
             fh.write(text)
 
     def _text_set_param(self, name: str, value: float) -> None:
-        """Replace ``.param <name>=<old>`` with new value in tmp file."""
+        """Replace ``.param <name>=<old>`` with new value in tmp file.
+
+        Works correctly for both single-param and multi-param ``.param`` lines,
+        e.g. ``TEXT ... .param R1=10k C1=100n`` where all params share one line.
+        """
         text = self._read_tmp()
         formatted = _format_value(value)
 
-        # Pattern covers: .param R1=10k  or  .param R1 = 10k  (with spaces)
-        pattern = re.compile(
-            r"(\.param\s+)(" + re.escape(name) + r")\s*=\s*\S+",
+        # Process line by line: for lines containing a .param directive,
+        # replace 'name=value' (word-boundary match) with the new value.
+        # This correctly handles multi-param lines like '.param R1=10k C1=100n'.
+        lines = text.splitlines(keepends=True)
+        new_lines = []
+        count = 0
+        param_re = re.compile(
+            r"\b" + re.escape(name) + r"\s*=\s*\S+",
             re.IGNORECASE,
         )
-        new_text, count = pattern.subn(
-            lambda m: f"{m.group(1)}{m.group(2)}={formatted}", text
-        )
+        for line in lines:
+            if re.search(r"\.param\b", line, re.IGNORECASE):
+                new_line, n = param_re.subn(f"{name}={formatted}", line)
+                count += n
+                new_lines.append(new_line)
+            else:
+                new_lines.append(line)
+
+        new_text = "".join(new_lines)
 
         if count == 0:
             logger.debug(
