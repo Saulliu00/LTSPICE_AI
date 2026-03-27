@@ -11,10 +11,11 @@ A modular Python pipeline that uses **LTspice as the simulation engine** and **O
 3. [Quickstart](#quickstart)
 4. [How to Define a New Circuit](#how-to-define-a-new-circuit)
 5. [Configuration Reference](#configuration-reference)
-6. [Objective Functions](#objective-functions)
-7. [Switching Optimization Engines](#switching-optimization-engines)
-8. [Plugging in ML Models](#plugging-in-ml-models)
-9. [Project Structure](#project-structure)
+6. [Defining Performance Targets](#defining-performance-targets)
+7. [Objective Functions](#objective-functions)
+8. [Switching Optimization Engines](#switching-optimization-engines)
+9. [Plugging in ML Models](#plugging-in-ml-models)
+10. [Project Structure](#project-structure)
 
 ---
 
@@ -90,14 +91,23 @@ python3 main.py --demo
 python3 main.py --config config/config.yaml --trials 50
 ```
 
+### Band-pass filter demo (no LTspice required)
+
+```bash
+python3 main.py --config config/bandpass_filter.yaml --demo
+```
+
+Targets f₀ = 1 kHz and BW = 200 Hz using a synthetic series RLC model.
+
 ### CLI options
 
 ```
---config PATH    Path to YAML config (default: config/config.yaml)
---trials N       Override n_trials from config
---engine ENGINE  Override engine: optuna | random | ml
---demo           Synthetic mode (no LTspice needed)
---no-browser     Don't auto-open plots in browser
+--config PATH        Path to YAML config (default: config/config.yaml)
+--trials N           Override n_trials from config
+--engine ENGINE      Override engine: optuna | random | ml
+--demo               Synthetic mode (no LTspice needed)
+--no-browser         Don't auto-open plots in browser
+--inspect ASC_PATH   Scan a .asc file and print discovered parameters
 ```
 
 Output plots are saved to `results/plots/` as interactive HTML files:
@@ -125,12 +135,45 @@ L1 value: {L1}
 
 Add a `.param` directive as the default fallback:
 ```
-.param R1=10k C1=100n
+.param R1=10k C1=100n L1=10u
 ```
 
 Save the `.asc` file to `circuits/your_circuit.asc`.
 
-### Step 2 — Update `config.yaml`
+### Step 2 — Auto-discover parameters with `--inspect`
+
+Run the inspect command to scan the schematic and see exactly what parameters were found, along with a suggested config snippet:
+
+```bash
+python3 main.py --inspect circuits/your_circuit.asc
+```
+
+Example output:
+```
+Inspecting: circuits/bandpass_filter.asc
+============================================================
+
+Tunable parameters found (3):
+  {C1}   default = 2.533u
+  {L1}   default = 10u
+  {R1}   default = 10
+
+Component instances (4):
+  C1        value = {C1}
+  L1        value = {L1}
+  R1        value = {R1}
+  V1        value = AC
+
+Simulation directives:
+  .ac dec 100 10 100Meg
+
+Suggested config/parameters section: ...
+Suggested config/targets section: ...
+```
+
+### Step 3 — Create your config file
+
+Copy the suggested output from `--inspect` into a new config file (e.g. `config/my_circuit.yaml`). Set the `min`/`max` bounds and fill in the `targets:` section with your performance goals:
 
 ```yaml
 circuit:
@@ -142,35 +185,53 @@ parameters:
     max: 100000.0
     log_scale: true
     type: float
-  C1:
-    min: 1.0e-9
-    max: 1.0e-6
-    log_scale: true
-    type: float
   L1:
     min: 1.0e-6
     max: 1.0e-3
     log_scale: true
     type: float
+  C1:
+    min: 1.0e-9
+    max: 1.0e-6
+    log_scale: true
+    type: float
+
+targets:
+  center_frequency:
+    signal: "V(out)"
+    value: 1000.0       # Hz
+    weight: 1.0
+  bandwidth:
+    signal: "V(out)"
+    value: 200.0        # Hz
+    weight: 1.0
 ```
 
-### Step 3 — Choose the right objective
-
-See [Objective Functions](#objective-functions) below.
+See [Defining Performance Targets](#defining-performance-targets) for all available target types.
 
 ### Step 4 — Run
 
 ```bash
-python3 main.py
+python3 main.py --config config/my_circuit.yaml
 ```
 
 ---
 
 ## Configuration Reference
 
+Two example configs are included:
+
+| File | Circuit | Objective |
+|---|---|---|
+| [config/config.yaml](config/config.yaml) | RC low-pass filter | Single cutoff target (1 kHz) |
+| [config/bandpass_filter.yaml](config/bandpass_filter.yaml) | Series RLC band-pass filter | f₀ = 1 kHz + BW = 200 Hz |
+
+Full annotated reference:
+
 ```yaml
 ltspice:
   executable: "/Applications/LTspice.app/Contents/MacOS/LTspice"
+  # executable: "C:/Program Files/LTC/LTspiceXVII/XVIIx64.exe"   # Windows
   timeout: 60         # seconds before subprocess is killed
   retry_count: 3      # retries on transient LTspice crash
 
@@ -178,6 +239,7 @@ circuit:
   schematic_path: "circuits/example_rc_filter.asc"
 
 parameters:
+  # One entry per tunable {PARAM} found in the schematic
   R1:
     min: 1000.0       # lower bound (Ω)
     max: 1000000.0    # upper bound (Ω)
@@ -187,15 +249,34 @@ parameters:
 optimization:
   engine: optuna      # "optuna" | "random" | "ml"
   n_trials: 50
-  direction: minimize # "minimize" | "maximize"
+  direction: minimize # always minimize (scores are error magnitudes)
   seed: 42
   sampler: tpe        # "tpe" | "cmaes" | "random"
 
-objective:
-  type: cutoff        # see Objective Functions section
-  target_signal: "V(out)"
-  filter_type: lowpass
-  target_cutoff_hz: 1000.0
+# ---------------------------------------------------------------------------
+# targets: — define what you want the circuit to achieve (recommended)
+# Multiple targets are combined with weighted sum automatically.
+# See "Defining Performance Targets" section for all types.
+# ---------------------------------------------------------------------------
+targets:
+  center_frequency:
+    signal: "V(out)"
+    value: 1000.0     # desired peak frequency (Hz)
+    weight: 1.0
+  bandwidth:
+    signal: "V(out)"
+    value: 200.0      # desired BW = f_high − f_low (Hz)
+    weight: 1.0
+
+# ---------------------------------------------------------------------------
+# objective: — legacy single-target format (still supported)
+# Use this OR targets:, not both.
+# ---------------------------------------------------------------------------
+# objective:
+#   type: cutoff
+#   target_signal: "V(out)"
+#   filter_type: lowpass
+#   target_cutoff_hz: 1000.0
 
 visualization:
   output_dir: "results/plots"
@@ -210,6 +291,71 @@ logging:
   level: INFO         # DEBUG | INFO | WARNING | ERROR
   log_file: "results/run.log"
 ```
+
+---
+
+## Defining Performance Targets
+
+Use the `targets:` section in your config to declare what the circuit must achieve. Each entry is a named target type with a `signal`, `value`, and `weight`. The pipeline combines all targets into a single score:
+
+```
+score = Σ  weight_i × |actual_i − target_i|
+```
+
+**Lower score = better match to all targets.**
+
+### Available target types
+
+| Type | Circuit | What it measures | Required keys |
+|---|---|---|---|
+| `cutoff` | LPF / HPF | -3 dB cutoff frequency | `signal`, `value` (Hz), `filter_type` |
+| `bandwidth` | BPF | f_high − f_low at -3 dB | `signal`, `value` (Hz) |
+| `center_frequency` | BPF / resonant | Frequency of peak response | `signal`, `value` (Hz) |
+| `gain_at_frequency` | Amplifier | Gain in dB at a given frequency | `signal`, `value` (dB), `freq` (Hz) |
+
+### Example — Band-pass filter with two targets
+
+```yaml
+targets:
+  center_frequency:
+    signal: "V(out)"
+    value: 1000.0       # Hz — where the peak must be
+    weight: 1.0
+  bandwidth:
+    signal: "V(out)"
+    value: 200.0        # Hz — f_high − f_low at -3 dB
+    weight: 1.0
+```
+
+### Example — LPF with single target
+
+```yaml
+targets:
+  cutoff:
+    signal: "V(out)"
+    value: 1000.0       # Hz
+    filter_type: lowpass
+    weight: 1.0
+```
+
+### Example — Amplifier with gain and frequency targets
+
+```yaml
+targets:
+  center_frequency:
+    signal: "V(out)"
+    value: 13560000.0   # Hz — 13.56 MHz ISM band
+    weight: 1.0
+  gain_at_frequency:
+    signal: "V(out)"
+    value: 10.0         # dB — desired gain at operating frequency
+    freq: 13560000.0
+    weight: 0.5         # half the weight of frequency accuracy
+```
+
+### Adjusting weights
+
+Weights express relative importance. A target with `weight: 2.0` contributes twice as much penalty as one with `weight: 1.0`. Start with equal weights and increase the weight of targets that matter most.
 
 ---
 
@@ -264,12 +410,52 @@ skirts of the passband at which the response falls 3 dB below the peak:
 
 Score = `|BW_actual − BW_target|` in Hz.
 
-**Config:**
+**Via `targets:` (recommended):**
+```yaml
+targets:
+  bandwidth:
+    signal: "V(out)"
+    value: 200.0        # desired BW in Hz
+    weight: 1.0
+```
+
+**Via legacy `objective:`:**
 ```yaml
 objective:
   type: bandwidth
   target_signal: "V(out)"
-  target_bw_hz: 500.0     # desired f_high − f_low in Hz
+  target_bw_hz: 200.0
+```
+
+---
+
+### `center_frequency` — Peak frequency (BPF / resonant)
+
+Score = `|f_0_actual − f_0_target|` in Hz.
+
+**Via `targets:`:**
+```yaml
+targets:
+  center_frequency:
+    signal: "V(out)"
+    value: 1000.0       # Hz
+    weight: 1.0
+```
+
+---
+
+### `gain_at_frequency` — Gain at a specific frequency
+
+Score = `|gain_actual_dB − gain_target_dB|`.
+
+**Via `targets:`:**
+```yaml
+targets:
+  gain_at_frequency:
+    signal: "V(out)"
+    value: 0.0          # dB (0 dB = unity gain)
+    freq: 1000.0        # Hz
+    weight: 1.0
 ```
 
 ---
@@ -434,7 +620,8 @@ The pipeline loop in `main.py` requires no changes.
 LTspice_AI/
 │
 ├── config/
-│   └── config.yaml              # All settings (paths, params, objective, etc.)
+│   ├── config.yaml              # RC LPF example (single cutoff target)
+│   └── bandpass_filter.yaml     # Series RLC BPF example (f₀ + BW targets)
 │
 ├── core/
 │   ├── __init__.py              # Shared types: ParameterSet, SimulationResult, TrialRecord
@@ -461,8 +648,10 @@ LTspice_AI/
 │   └── cache.py                 # MD5-keyed simulation cache (thread-safe, pickle-based)
 │
 ├── circuits/
-│   └── example_rc_filter.asc   # RC low-pass filter with {R1}, {C1} parameters
+│   ├── example_rc_filter.asc   # RC low-pass filter with {R1}, {C1} parameters
+│   └── bandpass_filter.asc     # Series RLC band-pass filter with {R1}, {L1}, {C1}
 │
-├── main.py                      # Pipeline class + CLI + demo mode (synthetic RC filter)
+├── main.py                      # Pipeline class + CLI + --inspect + demo mode
+├── skills.md                    # Circuit design reference (LPF/HPF/BPF/notch/buck/Class-E)
 └── requirements.txt
 ```

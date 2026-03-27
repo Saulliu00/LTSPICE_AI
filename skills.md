@@ -190,16 +190,72 @@ Bandwidth is:
 BW = f_high − f_low
 ```
 
-#### Pipeline objective
+#### Pipeline example — `config/bandpass_filter.yaml`
+
+The included [circuits/bandpass_filter.asc](circuits/bandpass_filter.asc) is a series RLC BPF with tunable `{R1}`, `{L1}`, `{C1}`.
+
+**Step 1 — Inspect the schematic to see what parameters were found:**
+```bash
+python3 main.py --inspect circuits/bandpass_filter.asc
+```
+
+**Step 2 — Define targets in [config/bandpass_filter.yaml](config/bandpass_filter.yaml):**
 ```yaml
-objective:
-  type: bandwidth
-  target_signal: "V(out)"
-  target_bw_hz: 200.0
+targets:
+  center_frequency:
+    signal: "V(out)"
+    value: 1000.0       # Hz — desired f_0 (peak response)
+    weight: 1.0
+
+  bandwidth:
+    signal: "V(out)"
+    value: 200.0        # Hz — desired BW = f_high − f_low
+    weight: 1.0
+```
+
+Both targets are combined automatically. The optimizer minimizes:
+```
+score = |f_0_actual − 1000| + |BW_actual − 200|
+```
+
+**Step 3 — Run (demo mode, no LTspice needed):**
+```bash
+python3 main.py --config config/bandpass_filter.yaml --demo --trials 80
+```
+
+**Step 4 — Run with real LTspice:**
+```bash
+python3 main.py --config config/bandpass_filter.yaml
+```
+
+**Parameter search bounds in `bandpass_filter.yaml`:**
+
+| Parameter | Min | Max | Scale |
+|---|---|---|---|
+| R1 (Ω) | 1 | 10 000 | log |
+| L1 (H) | 1 µH | 1 mH | log |
+| C1 (F) | 1 nF | 100 µF | log |
+
+**Adding a gain target** — uncomment in `bandpass_filter.yaml` to also optimize passband gain:
+```yaml
+targets:
+  center_frequency:
+    signal: "V(out)"
+    value: 1000.0
+    weight: 1.0
+  bandwidth:
+    signal: "V(out)"
+    value: 200.0
+    weight: 1.0
+  gain_at_frequency:
+    signal: "V(out)"
+    value: -3.0         # dB (typical passband insertion loss)
+    freq: 1000.0
+    weight: 0.5
 ```
 
 #### Design tip
-For a target f_0 and BW: `L = Q·R/(2π·f_0)` and `C = 1/(4π²·f_0²·L)`. Narrow BW (high Q) requires tight component tolerances.
+For a target f_0 and BW: `L = Q·R/(2π·f_0)` and `C = 1/(4π²·f_0²·L)` where `Q = f_0/BW`. Narrow BW (high Q) requires tight component tolerances. Use the `--inspect` output as a sanity check that your `.param` defaults give the right ballpark response before starting optimization.
 
 ---
 
