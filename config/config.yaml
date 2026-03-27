@@ -1,0 +1,90 @@
+# LTspice AI Optimization Pipeline Configuration
+# Example configuration for RC low-pass filter optimization
+
+# ---------------------------------------------------------------------------
+# LTspice Executable Path
+# Uncomment and set the path appropriate for your OS/installation.
+# ---------------------------------------------------------------------------
+ltspice:
+  # macOS (typical Homebrew or Applications install)
+  executable: "/Applications/LTspice.app/Contents/MacOS/LTspice"
+  # executable: "/usr/local/bin/ltspice"          # macOS (alternative)
+
+  # Windows (typical install paths)
+  # executable: "C:/Program Files/LTC/LTspiceXVII/XVIIx64.exe"
+  # executable: "C:/Program Files (x86)/LTC/LTspiceXVII/XVIIx86.exe"
+
+  # Linux (Wine-based install)
+  # executable: "wine ~/.wine/drive_c/Program Files/LTC/LTspiceXVII/XVIIx64.exe"
+
+  timeout: 60          # seconds to wait before killing subprocess
+  retry_count: 3       # number of retries on transient failure
+
+# ---------------------------------------------------------------------------
+# Schematic / Circuit
+# ---------------------------------------------------------------------------
+circuit:
+  schematic_path: "circuits/example_rc_filter.asc"
+
+# ---------------------------------------------------------------------------
+# Optimization Parameters
+# Each entry defines one tunable parameter.
+# ---------------------------------------------------------------------------
+parameters:
+  R1:
+    min: 1000.0          # 1 kΩ
+    max: 1000000.0       # 1 MΩ
+    log_scale: true
+    type: float
+
+  C1:
+    min: 1.0e-9          # 1 nF
+    max: 1.0e-6          # 1 µF
+    log_scale: true
+    type: float
+
+# ---------------------------------------------------------------------------
+# Optimization Engine
+# ---------------------------------------------------------------------------
+optimization:
+  engine: optuna          # "optuna" | "random" | "ml" (ml is stub)
+  n_trials: 50
+  direction: minimize     # "minimize" | "maximize"
+  seed: 42
+  sampler: tpe            # "tpe" | "cmaes" | "random"
+
+# ---------------------------------------------------------------------------
+# Objective Function
+# ---------------------------------------------------------------------------
+objective:
+  # "cutoff"    → LPF / HPF: optimise toward a target -3 dB cutoff frequency
+  # "bandwidth" → BPF:        optimise toward a target passband bandwidth (f_high − f_low)
+  # "mse"       → arbitrary:  minimise mean-squared error vs a target curve
+  # "peak"      → resonant:   minimise error in peak magnitude and frequency
+  type: cutoff
+  target_signal: "V(out)"
+  filter_type: lowpass            # "lowpass" | "highpass"  (only used when type=cutoff)
+  target_cutoff_hz: 1000.0        # desired -3 dB cutoff frequency in Hz (type=cutoff)
+  # target_bw_hz: 500.0           # desired bandwidth in Hz              (type=bandwidth / BPF)
+
+# ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
+visualization:
+  output_dir: "results/plots"
+  show_browser: true
+  save_html: true
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+cache:
+  enabled: true
+  cache_dir: "results/cache"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: INFO                    # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  log_file: "results/run.log"
