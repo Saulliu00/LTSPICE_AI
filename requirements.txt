@@ -1,7 +1,30 @@
-spicelib>=1.0
-optuna>=3.0
+# LTspice AI Optimization Pipeline — Python dependencies
+#
+# Recommended Python version: 3.10 or higher (3.12 preferred)
+# Minimum Python version:     3.9
+#
+# Install:
+#   pip install -r requirements.txt
+
+# --- Core simulation interface ---
+spicelib>=1.0           # LTspice netlist editing and .raw file parsing
+                        # Alternative: PyLTSpice>=5.0 (auto-detected as fallback)
+
+# --- Optimization ---
+optuna>=3.0             # Bayesian optimization (TPE, CMA-ES, random samplers)
+
+# --- Numerical / scientific ---
 numpy>=1.24
-plotly>=5.0
-pyyaml>=6.0
-scipy>=1.10
-pandas>=2.0
+scipy>=1.10             # Interpolation used in objective functions
+
+# --- Data ---
+pandas>=2.0             # Trial history DataFrames (optimizer.get_history_df)
+
+# --- Visualization ---
+plotly>=5.0             # All plots — convergence, scatter, frequency response
+
+# --- Configuration ---
+pyyaml>=6.0             # config/config.yaml parsing
+
+# --- ML module (optional — install when implementing surrogate model) ---
+# torch>=2.0
