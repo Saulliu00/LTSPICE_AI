@@ -42,17 +42,28 @@ logger = logging.getLogger(__name__)
 # Optional dependency detection
 # ---------------------------------------------------------------------------
 
-_SPICELIB_AVAILABLE = False
-_PYLTSPICE_AVAILABLE = False
+_SPICELIB_ASC_AVAILABLE = False   # spicelib AscEditor  (.asc files)
+_SPICELIB_NET_AVAILABLE = False   # spicelib SpiceEditor (.net files)
+_PYLTSPICE_AVAILABLE = False      # PyLTSpice fallback
+
+# spicelib >= 1.0 ships AscEditor for .asc and SpiceEditor for .net/.sp.
+# Using SpiceEditor on a .asc raises "Expected pattern ^\*" because it
+# expects a SPICE netlist title line — always use AscEditor for .asc.
+try:
+    from spicelib.editor.asc_editor import AscEditor as _AscEditor  # type: ignore
+    _SPICELIB_ASC_AVAILABLE = True
+    logger.debug("spicelib.AscEditor available")
+except ImportError:
+    _AscEditor = None  # type: ignore
 
 try:
-    from spicelib import SpiceEditor as _SpiceEditor  # type: ignore
-    _SPICELIB_AVAILABLE = True
+    from spicelib.editor.spice_editor import SpiceEditor as _SpiceEditor  # type: ignore
+    _SPICELIB_NET_AVAILABLE = True
     logger.debug("spicelib.SpiceEditor available")
 except ImportError:
-    pass
+    _SpiceEditor = None  # type: ignore
 
-if not _SPICELIB_AVAILABLE:
+if not _SPICELIB_ASC_AVAILABLE and not _SPICELIB_NET_AVAILABLE:
     try:
         from PyLTSpice import SpiceEditor as _SpiceEditor  # type: ignore
         _PYLTSPICE_AVAILABLE = True
@@ -271,28 +282,65 @@ class NetlistEditor:
     # ------------------------------------------------------------------
 
     def _make_temp_copy(self) -> str:
-        """Create a temporary copy of the original schematic and return its path."""
+        """Create a temporary copy of the original schematic and return its path.
+
+        The copy is placed in the same directory as the original so that
+        spicelib's AscEditor can resolve relative symbol paths (``.asy`` files)
+        the same way LTspice would.
+        """
         suffix = Path(self._original_path).suffix
-        fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="ltspice_trial_")
+        schematic_dir = Path(self._original_path).parent
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=suffix,
+            prefix="_ltspice_editor_",
+            dir=schematic_dir,
+        )
         os.close(fd)
         shutil.copy2(self._original_path, tmp_path)
         return tmp_path
 
     def _load_editor(self) -> Optional[object]:
-        """Instantiate the best available editor on the temp copy."""
-        if _SPICELIB_AVAILABLE or _PYLTSPICE_AVAILABLE:
+        """Instantiate the best available editor on the temp copy.
+
+        For ``.asc`` files uses spicelib ``AscEditor``; for ``.net``/``.sp``
+        uses ``SpiceEditor``.  Falls back to ``PyLTSpice`` or plain text.
+        """
+        suffix = Path(self._tmp_path).suffix.lower()
+        is_asc = suffix == ".asc"
+
+        # --- spicelib path ---
+        if is_asc and _SPICELIB_ASC_AVAILABLE:
             try:
-                editor = _SpiceEditor(self._tmp_path)  # type: ignore[name-defined]
-                return editor
+                return _AscEditor(self._tmp_path)  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not initialise AscEditor: %s  → using text fallback", exc
+                )
+        elif not is_asc and _SPICELIB_NET_AVAILABLE:
+            try:
+                return _SpiceEditor(self._tmp_path)  # type: ignore[misc]
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Could not initialise SpiceEditor: %s  → using text fallback", exc
                 )
+
+        # --- PyLTSpice fallback ---
+        if _PYLTSPICE_AVAILABLE:
+            try:
+                return _SpiceEditor(self._tmp_path)  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not initialise PyLTSpice SpiceEditor: %s  → text fallback", exc
+                )
+
         return None
 
     def _backend_name(self) -> str:
-        if _SPICELIB_AVAILABLE:
-            return "spicelib"
+        suffix = Path(self._tmp_path).suffix.lower() if hasattr(self, "_tmp_path") else ""
+        if suffix == ".asc" and _SPICELIB_ASC_AVAILABLE:
+            return "spicelib.AscEditor"
+        if _SPICELIB_NET_AVAILABLE:
+            return "spicelib.SpiceEditor"
         if _PYLTSPICE_AVAILABLE:
             return "PyLTSpice"
         return "text-fallback"

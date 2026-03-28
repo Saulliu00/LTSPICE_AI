@@ -83,11 +83,15 @@ class LTSpiceRunner:
         :class:`SimulationError`.  Default: ``3``.
     """
 
-    # CLI flags used by LTspice XVII on each platform
+    # CLI flags used by LTspice XVII on each platform.
+    #
+    # macOS / Linux: -b alone runs headlessly and exits when done.
+    #   Adding -Run overrides -b and opens the GUI, causing a timeout.
+    # Windows: -Run is required to trigger execution; -b suppresses dialogs.
     _BATCH_FLAGS: dict[str, List[str]] = {
-        "darwin": ["-b", "-Run"],
-        "win32":  ["-b", "-Run"],
-        "linux":  ["-b", "-Run"],
+        "darwin": ["-b"],
+        "win32":  ["-Run", "-b"],
+        "linux":  ["-b"],
     }
 
     def __init__(
@@ -190,7 +194,7 @@ class LTSpiceRunner:
         flags = self._BATCH_FLAGS[platform_key]
 
         cmd: List[str] = [self.executable_path] + flags + [schematic_path]
-        logger.debug("Subprocess command: %s", " ".join(cmd))
+        logger.info("LTspice command: %s", " ".join(cmd))
 
         try:
             proc = subprocess.run(
@@ -220,14 +224,21 @@ class LTSpiceRunner:
         stderr = proc.stderr.decode(errors="replace").strip()
 
         if stdout:
-            logger.debug("LTspice stdout:\n%s", stdout)
+            logger.info("LTspice stdout:\n%s", stdout)
         if stderr:
-            logger.debug("LTspice stderr:\n%s", stderr)
+            logger.info("LTspice stderr:\n%s", stderr)
 
         if proc.returncode != 0:
+            logger.error(
+                "LTspice failed (code %d).\n  command : %s\n  stdout  : %s\n  stderr  : %s",
+                proc.returncode,
+                " ".join(cmd),
+                stdout or "(empty)",
+                stderr or "(empty)",
+            )
             raise SimulationError(
                 f"LTspice exited with code {proc.returncode}. "
-                f"stderr: {stderr[:500]}",
+                f"stdout: {stdout[:300]}  stderr: {stderr[:300]}",
                 schematic_path=schematic_path,
                 returncode=proc.returncode,
             )

@@ -336,12 +336,23 @@ class Pipeline:
         -------
         SimulationResult
         """
-        # Write a temporary schematic with the new parameter values
+        # Write the temporary schematic into the same directory as the
+        # original so LTspice can find it and write the .raw output there.
+        # Using the system temp (/var/folders/…) fails on macOS because
+        # LTspice's sandbox may not have read/write access to that path.
+        schematic_dir = Path(self._schematic_path).parent
         tmp_fd, tmp_path = tempfile.mkstemp(
             suffix=Path(self._schematic_path).suffix,
-            prefix="ltspice_trial_",
+            prefix="_ltspice_trial_",
+            dir=schematic_dir,
         )
         os.close(tmp_fd)
+
+        if self.editor is None:
+            raise RuntimeError(
+                "_run_ltspice called but NetlistEditor is not initialised. "
+                "This should never happen outside demo mode."
+            )
 
         try:
             self.editor.restore()
