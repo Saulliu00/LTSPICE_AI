@@ -94,6 +94,11 @@ class PipelineVisualizer:
         *output_dir*.
     """
 
+    # Plot names that are auto-opened in the browser when show_browser=True.
+    # Keep this small: open the most informative plots first.
+    # For filter designs: frequency_response first, then dashboard.
+    _AUTO_OPEN_PLOTS = {"frequency_response", "waveform", "dashboard"}
+
     def __init__(
         self,
         output_dir: str = "results/plots",
@@ -701,7 +706,7 @@ class PipelineVisualizer:
             except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to save figure %s: %s", html_path, exc)
 
-        if self.show_browser:
+        if self.show_browser and name in self._AUTO_OPEN_PLOTS:
             try:
                 fig.show()
             except Exception as exc:  # noqa: BLE001

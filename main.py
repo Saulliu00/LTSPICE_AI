@@ -27,12 +27,13 @@ CLI usage::
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -61,6 +62,106 @@ from utils.cache import SimulationCache
 from visualization.plotly_visualizer import PipelineVisualizer
 
 logger = logging.getLogger("pipeline")
+
+
+# ---------------------------------------------------------------------------
+# Report helpers
+# ---------------------------------------------------------------------------
+
+
+def _fmt_hz(hz: float) -> str:
+    """Format a frequency value with an appropriate SI prefix."""
+    if hz >= 1e9:
+        return f"{hz / 1e9:.4g} GHz"
+    if hz >= 1e6:
+        return f"{hz / 1e6:.4g} MHz"
+    if hz >= 1e3:
+        return f"{hz / 1e3:.4g} kHz"
+    return f"{hz:.4g} Hz"
+
+
+def _fmt_param(name: str, value: float) -> str:
+    """Format a component value with a guessed unit suffix."""
+    name_upper = name.upper()
+    if name_upper.startswith("R"):
+        if value >= 1e6:
+            return f"{value / 1e6:.4g} MΩ"
+        if value >= 1e3:
+            return f"{value / 1e3:.4g} kΩ"
+        return f"{value:.4g} Ω"
+    if name_upper.startswith("C"):
+        if value >= 1e-6:
+            return f"{value / 1e-6:.4g} µF"
+        if value >= 1e-9:
+            return f"{value / 1e-9:.4g} nF"
+        if value >= 1e-12:
+            return f"{value / 1e-12:.4g} pF"
+        return f"{value:.4g} F"
+    if name_upper.startswith("L"):
+        if value >= 1e-3:
+            return f"{value / 1e-3:.4g} mH"
+        if value >= 1e-6:
+            return f"{value / 1e-6:.4g} µH"
+        return f"{value:.4g} H"
+    return f"{value:.4g}"
+
+
+def _normalize_score(raw_score: float, config: dict) -> float:
+    """Convert a raw objective score to a 0–100 quality scale.
+
+    100 = perfect match to the design target.
+    0   = error equal to (or exceeding) the target value itself.
+
+    The normalisation uses the design target value as the reference:
+        quality = max(0, 100 × (1 − |error| / target_value))
+    """
+    obj_cfg = config.get("objective") or {}
+    obj_type = obj_cfg.get("type", "")
+
+    target: Optional[float] = None
+    if obj_type == "cutoff":
+        target = obj_cfg.get("target_cutoff_hz")
+    elif obj_type == "bandwidth":
+        target = obj_cfg.get("target_bw_hz")
+    elif obj_type in ("gain_at_frequency", "center_frequency"):
+        target = obj_cfg.get("target_hz") or obj_cfg.get("target_gain_db")
+    else:
+        # composite targets: use the largest weighted target value as reference
+        targets_cfg = config.get("targets") or {}
+        vals = [
+            float(t["value"])
+            for t in targets_cfg.values()
+            if isinstance(t, dict) and "value" in t
+        ]
+        target = max(vals) if vals else None
+
+    if target and target > 0:
+        return max(0.0, 100.0 * (1.0 - abs(raw_score) / float(target)))
+    # Fallback: treat score=0 as 100, score≥100 as 0
+    return max(0.0, 100.0 - abs(raw_score))
+
+
+def _find_minus3db_freq(result: SimulationResult) -> Optional[float]:
+    """Return the -3 dB frequency from the first AC signal in *result*."""
+    if result is None or result.sim_type != "ac":
+        return None
+    freq = result.time_or_freq
+    signals = result.signals
+    if freq is None or not signals:
+        return None
+    sig = next(iter(signals.values()))
+    if sig is None or len(sig) == 0:
+        return None
+    mag = np.abs(sig)
+    mag_db = 20.0 * np.log10(mag + 1e-300)
+    threshold = np.max(mag_db) - 3.0
+    for i in range(len(mag_db) - 1):
+        if mag_db[i] >= threshold >= mag_db[i + 1]:
+            f1, f2 = freq[i], freq[i + 1]
+            d1, d2 = mag_db[i], mag_db[i + 1]
+            t = (threshold - d1) / (d2 - d1) if d2 != d1 else 0.5
+            return float(f1 * (f2 / f1) ** t)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -445,28 +546,212 @@ class Pipeline:
         """
         logger.info("Generating visualisations …")
         history = self.optimizer.history
+        signal_names = list(best_result.signals.keys())[:3]
 
-        # 1. Convergence
+        # 1. Frequency / waveform — shown first in browser (most relevant for filter design)
+        if best_result.sim_type == "ac":
+            self.visualizer.plot_frequency_response(best_result, signal_names)
+        else:
+            self.visualizer.plot_waveform(best_result, signal_names)
+
+        # 2. Convergence (saved to HTML only)
         self.visualizer.plot_convergence(history)
 
-        # 2. Parameter scatters
+        # 3. Parameter scatter (saved to HTML only)
         param_names = list(self.search_space._name_to_spec.keys())
         if param_names:
             px = param_names[0]
             py = param_names[1] if len(param_names) > 1 else None
             self.visualizer.plot_parameter_scatter(history, px, py)
 
-        # 3. Frequency / waveform
-        signal_names = list(best_result.signals.keys())[:3]
-        if best_result.sim_type == "ac":
-            self.visualizer.plot_frequency_response(best_result, signal_names)
-        else:
-            self.visualizer.plot_waveform(best_result, signal_names)
-
-        # 4. Dashboard
+        # 4. Dashboard — auto-opened in browser alongside frequency response
         self.visualizer.create_dashboard(history, best_result)
 
         logger.info("Visualisation complete")
+
+    # ------------------------------------------------------------------
+    # Report generation
+    # ------------------------------------------------------------------
+
+    def generate_report(
+        self,
+        best_trial: TrialRecord,
+        best_result: Optional[SimulationResult],
+    ) -> str:
+        """Write a Markdown design report and return its path.
+
+        The report captures the design requirements, optimized component
+        values, achieved performance, and links to the saved HTML plots.
+
+        Parameters
+        ----------
+        best_trial:
+            The best :class:`~core.TrialRecord` from the optimisation run.
+        best_result:
+            Parsed simulation result for the best trial (may be ``None``).
+
+        Returns
+        -------
+        str
+            Absolute path to the written ``.md`` file.
+        """
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        date_tag = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        vis_cfg = self.config.get("visualization", {})
+        plots_dir = Path(vis_cfg.get("output_dir", "results/plots"))
+        results_dir = plots_dir.parent
+        results_dir.mkdir(parents=True, exist_ok=True)
+        report_path = results_dir / f"report_{date_tag}.md"
+
+        circuit_path = self.config.get("circuit", {}).get("schematic_path", "unknown")
+        opt_cfg = self.config.get("optimization", {})
+        engine = opt_cfg.get("engine", "optuna")
+        sampler = opt_cfg.get("sampler", "")
+        engine_label = f"{engine} ({sampler})" if sampler else engine
+
+        # --- objective / targets info ---
+        obj_cfg = self.config.get("objective") or {}
+        targets_cfg = self.config.get("targets") or {}
+        obj_type = obj_cfg.get("type", "")
+        filter_type = obj_cfg.get("filter_type", "")
+        target_fc = obj_cfg.get("target_cutoff_hz")
+        target_bw = obj_cfg.get("target_bw_hz")
+
+        # --- achieved performance ---
+        achieved_fc = _find_minus3db_freq(best_result)
+
+        # --- plot files that actually exist ---
+        plot_files: List[Tuple[str, str]] = []
+        for label, fname in [
+            ("Frequency Response", "frequency_response.html"),
+            ("Optimization Convergence", "convergence.html"),
+            ("Dashboard", "dashboard.html"),
+        ]:
+            if (plots_dir / fname).exists():
+                plot_files.append((label, fname))
+        # scatter: only include files whose name contains current parameter names
+        param_names_set = set(self.config.get("parameters", {}).keys())
+        for f in sorted(plots_dir.glob("scatter_*.html")):
+            stem_parts = set(f.stem.replace("scatter_", "").split("_vs_"))
+            if stem_parts <= param_names_set:
+                plot_files.append((f"Parameter Scatter ({f.stem})", f.name))
+
+        # --- build markdown ---
+        lines: List[str] = [
+            "# Circuit Design Report",
+            "",
+            f"**Generated:** {timestamp}  ",
+            f"**Circuit:** `{circuit_path}`  ",
+            f"**Engine:** {engine_label} — {self.n_trials} trials",
+            "",
+            "---",
+            "",
+            "## Design Requirements",
+            "",
+        ]
+
+        # Requirements table
+        req_rows: List[Tuple[str, str]] = []
+        if obj_type == "cutoff":
+            ft_label = "Low-pass" if filter_type == "lowpass" else "High-pass"
+            req_rows.append(("Filter type", f"{ft_label} (RC)"))
+            if target_fc is not None:
+                req_rows.append(("Target cutoff frequency (−3 dB)", _fmt_hz(target_fc)))
+        elif obj_type == "bandwidth" and target_bw is not None:
+            req_rows.append(("Target bandwidth", _fmt_hz(target_bw)))
+        elif targets_cfg:
+            for tname, tcfg in targets_cfg.items():
+                if isinstance(tcfg, dict):
+                    val = tcfg.get("value")
+                    if val is not None:
+                        req_rows.append((tname, _fmt_hz(float(val))))
+
+        if req_rows:
+            lines += ["| Target | Value |", "|--------|-------|"]
+            for k, v in req_rows:
+                lines.append(f"| {k} | {v} |")
+            lines.append("")
+
+        # Search space table
+        params_cfg = self.config.get("parameters", {})
+        if params_cfg:
+            lines += [
+                "### Search Space",
+                "",
+                "| Parameter | Min | Max | Scale |",
+                "|-----------|-----|-----|-------|",
+            ]
+            for pname, spec in params_cfg.items():
+                mn = spec.get("min", "?")
+                mx = spec.get("max", "?")
+                scale = "log" if spec.get("log_scale") else "linear"
+                lines.append(f"| {pname} | {mn} | {mx} | {scale} |")
+            lines.append("")
+
+        # Results
+        lines += [
+            "---",
+            "",
+            "## Optimization Results",
+            "",
+            "### Optimized Component Values",
+            "",
+            "| Parameter | Value |",
+            "|-----------|-------|",
+        ]
+        for pname, pval in best_trial.params.items():
+            lines.append(f"| **{pname}** | {_fmt_param(pname, float(pval))} |")
+
+        lines.append("")
+
+        # Performance metrics
+        perf_rows: List[Tuple[str, str]] = []
+        if obj_type == "cutoff" and target_fc is not None:
+            if achieved_fc is not None:
+                perf_rows.append(("Achieved fc (−3 dB)", _fmt_hz(achieved_fc)))
+            perf_rows.append(("Target fc", _fmt_hz(target_fc)))
+            error_hz = float(best_trial.score)
+            error_pct = (error_hz / target_fc) * 100
+            perf_rows.append(("Frequency error", f"{_fmt_hz(error_hz)} ({error_pct:.1f}%)"))
+
+        if perf_rows:
+            lines += [
+                "### Achieved Performance",
+                "",
+                "| Metric | Value |",
+                "|--------|-------|",
+            ]
+            for k, v in perf_rows:
+                lines.append(f"| **{k}** | {v} |")
+            lines.append("")
+
+        quality = _normalize_score(float(best_trial.score), self.config)
+        lines += [
+            f"> **Best trial:** #{best_trial.trial_id} of {self.n_trials}"
+            f"  |  **Quality score:** {quality:.1f} / 100",
+            "",
+            "---",
+            "",
+            "## Plots",
+            "",
+            "| Plot | Link |",
+            "|------|------|",
+        ]
+        for label, fname in plot_files:
+            lines.append(f"| {label} | [Open](plots/{fname}) |")
+
+        lines += [
+            "",
+            "---",
+            "",
+            "*Generated by LTspice AI Optimization Pipeline*",
+            "",
+        ]
+
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        logger.info("Report saved → %s", report_path)
+        return str(report_path)
 
     # ------------------------------------------------------------------
     # Config loader
@@ -717,18 +1002,22 @@ def main() -> None:
     else:
         logger.warning("No best result available – skipping visualisation")
 
+    report_path = pipeline.generate_report(best_trial, best_result)
+
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
+    quality = _normalize_score(float(best_trial.score), pipeline.config)
     print("\n" + "=" * 60)
     print("  OPTIMISATION COMPLETE")
     print("=" * 60)
-    print(f"  Best trial : #{best_trial.trial_id}")
-    print(f"  Best score : {best_trial.score:.6g}")
+    print(f"  Best trial   : #{best_trial.trial_id}")
+    print(f"  Quality score: {quality:.1f} / 100")
     print("  Best params:")
     for k, v in best_trial.params.items():
-        print(f"    {k:>12s} = {v:.4g}")
+        print(f"    {k:>12s} = {_fmt_param(k, float(v))}")
     print("=" * 60)
+    print(f"\n  Report     : {report_path}")
 
 
 if __name__ == "__main__":
